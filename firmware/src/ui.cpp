@@ -547,6 +547,20 @@ static void build_notes_page(lv_obj_t* parent) {
     ui_update_note("");
 }
 
+static void update_note_checkbox_hit_area(lv_event_t* event) {
+    auto* checkbox = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    const int32_t width = lv_obj_get_width(checkbox);
+    const int32_t height = lv_obj_get_height(checkbox);
+    // For a nearly square checkbox, add half of (sqrt(1.4) - 1) per edge.
+    const int32_t padding = ((width + height) * 46 + 500) / 1000;
+    lv_obj_set_ext_click_area(checkbox, padding);
+
+    // Let input reach the checkbox even where its hit area crosses the row edge.
+    auto* row = lv_obj_get_parent(checkbox);
+    lv_obj_set_ext_draw_size(row, padding);
+    lv_obj_refresh_ext_draw_size(row);
+}
+
 void ui_update_note(const char* text, uint32_t done) {
     lv_obj_clean(note_card);
     note_count = 0;
@@ -567,6 +581,7 @@ void ui_update_note(const char* text, uint32_t done) {
         lv_obj_set_size(row, width, LV_SIZE_CONTENT);
         lv_obj_set_style_min_height(row, lv_font_get_line_height(LV_FONT_DEFAULT) + 20, 0);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
         auto* checkbox = lv_checkbox_create(row);
         lv_checkbox_set_text_static(checkbox, "");
         lv_obj_set_style_pad_all(checkbox, 10, LV_PART_INDICATOR);
@@ -576,6 +591,7 @@ void ui_update_note(const char* text, uint32_t done) {
         lv_obj_set_style_bg_color(checkbox, COL_PANEL, LV_PART_INDICATOR | LV_STATE_CHECKED);
         lv_obj_set_style_bg_image_recolor(checkbox, lv_color_hex(0x58D97C), LV_PART_INDICATOR | LV_STATE_CHECKED);
         lv_obj_set_style_bg_image_recolor_opa(checkbox, LV_OPA_COVER, LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_add_event_cb(checkbox, update_note_checkbox_hit_area, LV_EVENT_SIZE_CHANGED, nullptr);
         lv_obj_add_event_cb(checkbox, note_check_changed, LV_EVENT_VALUE_CHANGED, reinterpret_cast<void*>(index));
         auto* label = lv_label_create(row);
         lv_obj_set_pos(label, note_x, 0);
