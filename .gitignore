@@ -12,7 +12,8 @@ firmware/.vscode/
 tools/node_modules/
 tools/package-lock.json
 
-# Mac daemon venv
+# Python environments
+.venv/
 daemon/.venv/
 
 # Python bytecode cache

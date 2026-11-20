@@ -23,7 +23,12 @@ void brightness_init(void) {
 }
 
 void brightness_cycle(void) {
-    cur_idx = (cur_idx + 1) % LEVELS_COUNT;
+    brightness_set_step((cur_idx + 1) % LEVELS_COUNT);
+}
+
+void brightness_set_step(uint8_t step) {
+    if (step >= LEVELS_COUNT || step == cur_idx) return;
+    cur_idx = step;
 
     Preferences prefs;
     prefs.begin("clawdmeter", false);

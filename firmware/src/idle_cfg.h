@@ -3,7 +3,11 @@
 // Auto-sleep / idle screen-off configuration.
 // All tunables live here so nothing is hard-coded in main.cpp / idle.cpp.
 
-#define IDLE_TIMEOUT_MS             (30UL * 60UL * 1000UL)  // 30 min
+#ifdef BOARD_AMOLED_216_C6
+#define IDLE_TIMEOUT_MS             (10UL * 60UL * 1000UL)
+#else
+#define IDLE_TIMEOUT_MS             (30UL * 60UL * 1000UL)
+#endif
 #define IDLE_FADE_OUT_MS            400      // fade-to-black duration
 #define IDLE_FADE_IN_MS             180      // wake fade-in (snappier)
 #define IDLE_FADE_STEP_MS           20       // tick interval per fade step
@@ -14,7 +18,11 @@
 // wakes from sleep when USB is plugged back in). Useful when sitting on a
 // desk plugged in — also covers battery-less hardware that's always on USB.
 // Set true to sleep regardless of power source.
+#ifdef BOARD_AMOLED_216_C6
+#define IDLE_SLEEP_WHEN_CHARGING    true
+#else
 #define IDLE_SLEEP_WHEN_CHARGING    false
+#endif
 
 // When true, a touch on the dark panel wakes the device (first touch is
 // consumed for wake only, second touch acts normally). When false, touch is

@@ -1,3 +1,16 @@
+## Clawdmeter Wi‑Fi · Codex · Заметки
+
+Эта версия рассчитана на **Waveshare ESP32-C6-Touch-AMOLED-2.16** и Windows. Она основана на ветке [`csb-buddy` проекта juppeee](https://github.com/juppeee/Clawdmeter), который продолжает [исходный Clawdmeter Hermann Björgvin](https://github.com/HermannBjorgvin/Clawdmeter).
+
+- Лимиты Claude Code и Codex с точным временем сброса и обратным отсчётом при исчерпании пятчасового окна.
+- Список заметок с сенсорными галочками, статистика экранного времени и время с отключения USB-питания.
+- Пульт Windows, синхронизация и обновление прошивки по Wi‑Fi после первоначальной настройки через USB.
+- 18 ретро-анимаций Clawd, общая сцена ожидания, мини-игра и глубокий сон.
+
+[Установка и инструкция](docs/clawdmeter-wifi-guide.md) · [Превью анимаций](assets/clawdmeter-retro-preview.gif)
+
+Ниже сохранена документация проекта, на котором основана эта версия.
+
 > ### This is a fork
 >
 > The Clawdmeter — the device, this firmware, the board ports, the LVGL work,

@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <lvgl.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <esp_heap_caps.h>
 
 #include "data.h"
@@ -13,6 +14,37 @@
 #include "idle.h"
 #include "idle_cfg.h"
 #include "brightness.h"
+#include "wifi_sync.h"
+#include "screen_time.h"
+#ifdef BOARD_AMOLED_216_C6
+#include "boards/waveshare_amoled_216_c6/board.h"
+#include <esp_sleep.h>
+#include <WiFi.h>
+void board_display_sleep();
+
+static void enter_board_sleep() {
+    if (!idle_is_fully_asleep() || digitalRead(TP_INT) == LOW) return;
+    if (esp_sleep_enable_ext1_wakeup_io(1ULL << TP_INT, ESP_EXT1_WAKEUP_ANY_LOW) != ESP_OK) return;
+    screen_time_flush();
+    board_display_sleep();
+    if (wifi_sync_configured()) WiFi.mode(WIFI_OFF);
+    Serial.println("Deep sleep; tap screen to wake");
+    Serial.flush();
+    esp_deep_sleep_start();
+}
+
+static void track_limit_change(screen_t screen, const UsageData& data) {
+    static bool seen[SCREEN_COUNT];
+    static float session[SCREEN_COUNT];
+    static float weekly[SCREEN_COUNT];
+    if (!seen[screen] || session[screen] != data.session_pct || weekly[screen] != data.weekly_pct) {
+        idle_note_limit_change();
+    }
+    seen[screen] = true;
+    session[screen] = data.session_pct;
+    weekly[screen] = data.weekly_pct;
+}
+#endif
 
 #include "hal/board_caps.h"
 #include "hal/display_hal.h"
@@ -23,6 +55,7 @@
 #include "hal/sound_hal.h"
 
 static UsageData usage = {};
+static UsageData codex_usage = {};
 
 // ---- LVGL draw buffers (partial render mode) ----
 // PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
@@ -39,8 +72,6 @@ static uint16_t* buf1 = nullptr;
 static uint16_t* buf2 = nullptr;
 
 // Abstecher vom Splash auf die Auslastungszahlen: alle EVERY fuer SHOW lang.
-#define USAGE_PEEK_EVERY_MS  (5UL * 60UL * 1000UL)
-#define USAGE_PEEK_SHOW_MS   (60UL * 1000UL)
 
 static uint32_t my_tick(void) { return millis(); }
 
@@ -71,11 +102,13 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     bool pressed;
     touch_hal_read(&x, &y, &pressed);
     const bool raw_pressed = pressed;
+    ui_note_touch(raw_pressed);
 
     if (IDLE_WAKE_ON_TOUCH) {
         static bool touch_was = false;
         static bool touch_wake_swallowed = false;
         if (raw_pressed && !touch_was) {
+            if (!idle_is_asleep()) idle_note_activity();
             // Press edge — consume as wake if asleep.
             if (idle_consume_wake_press()) {
                 touch_wake_swallowed = true;
@@ -116,8 +149,12 @@ static bool parse_json(const char* json, UsageData* out) {
 
     out->session_pct = doc["s"] | 0.0f;
     out->session_reset_mins = doc["sr"] | -1;
+    out->session_reset_secs = doc["ss"] | -1;
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
+    out->weekly_reset_secs = doc["ws"] | -1;
+    strlcpy(out->session_reset_clock, doc["sa"] | "", sizeof(out->session_reset_clock));
+    strlcpy(out->weekly_reset_clock, doc["wa"] | "", sizeof(out->weekly_reset_clock));
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
     out->chime = doc["c"] | false;   // absent (old daemon / chime off) → stay silent
     const char* acct = doc["acct"] | "pro";
@@ -130,13 +167,30 @@ static bool parse_json(const char* json, UsageData* out) {
     out->clock_fmt = doc["tf"] | 24;
     out->ok = doc["ok"] | false;
     out->valid = true;
+    JsonObjectConst codex = doc["codex"].as<JsonObjectConst>();
+    codex_usage.valid = codex["s"].is<float>() && codex["w"].is<float>();
+    if (codex_usage.valid) {
+        codex_usage.session_pct = codex["s"].as<float>();
+        codex_usage.weekly_pct = codex["w"].as<float>();
+        codex_usage.session_reset_mins = codex["sr"] | -1;
+        codex_usage.session_reset_secs = codex["ss"] | -1;
+        codex_usage.weekly_reset_mins = codex["wr"] | -1;
+        codex_usage.weekly_reset_secs = codex["ws"] | -1;
+        strlcpy(codex_usage.session_reset_clock, codex["sa"] | "", sizeof(codex_usage.session_reset_clock));
+        strlcpy(codex_usage.weekly_reset_clock, codex["wa"] | "", sizeof(codex_usage.weekly_reset_clock));
+    }
     return true;
 }
 
 // ---- Serial command buffer ----
+#ifdef BOARD_AMOLED_216_C6
+#define CMD_BUF_SIZE 720
+#else
 #define CMD_BUF_SIZE 64
+#endif
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
+static bool cmd_overflow = false;
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
@@ -180,7 +234,18 @@ static void check_serial_cmd() {
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || c == '\r') {
+            if (cmd_overflow) {
+                cmd_overflow = false;
+                cmd_pos = 0;
+                continue;
+            }
             cmd_buf[cmd_pos] = '\0';
+#ifdef BOARD_AMOLED_216_C6
+            if (strncmp(cmd_buf, "wifi-config ", 12) == 0) wifi_sync_configure(cmd_buf + 12);
+            else if (strncmp(cmd_buf, "wifi-key ", 9) == 0) wifi_sync_replace_key(cmd_buf + 9);
+            else if (strcmp(cmd_buf, "wifi-status") == 0) wifi_sync_status();
+            else
+#endif
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
             // Play the charge overlay without touching the cable — the real
@@ -189,8 +254,10 @@ static void check_serial_cmd() {
             else if (strcmp(cmd_buf, "charge") == 0)   charge_anim_play(true);
             else if (strcmp(cmd_buf, "uncharge") == 0) charge_anim_play(false);
             cmd_pos = 0;
-        } else if (cmd_pos < CMD_BUF_SIZE - 1) {
+        } else if (!cmd_overflow && cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
+        } else {
+            cmd_overflow = true;
         }
     }
 }
@@ -239,13 +306,23 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    ble_init();
+#ifdef BOARD_AMOLED_216_C6
+    wifi_sync_init();
+    if (!wifi_sync_configured())
+#endif
+        ble_init();
     input_hal_init();
 
     ui_init();
+    screen_time_init();
+    Preferences notes;
+    if (notes.begin("notes", true)) {
+        ui_update_note(notes.getString("current").c_str(), notes.getUInt("checks", notes.getBool("done")));
+        notes.end();
+    }
     ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
-    ui_show_screen(SCREEN_SPLASH);
+    ui_show_screen(SCREEN_USAGE);
 
     Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
         board_caps().name, W, H);
@@ -301,9 +378,13 @@ static void pair_tick(void) {
 
 void loop() {
     idle_tick();
+    screen_time_tick(idle_is_display_lit());
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
+#ifdef BOARD_AMOLED_216_C6
+    if (!wifi_sync_configured())
+#endif
+        ble_tick();
     power_hal_tick();
     imu_hal_tick();
     sound_hal_tick();
@@ -314,9 +395,9 @@ void loop() {
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → on splash: cycle animations; on usage: cycle brightness;
+    //   PRIMARY   → toggle the animated splash
+    //   SECONDARY → Claude, Codex
+    //   PWR       → cycle brightness;
     //               hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
     // idle_consume_wake_press(); the normal action fires from the second
@@ -324,30 +405,41 @@ void loop() {
     // so no separate idle_note_activity() call is needed here.
     {
         static bool primary_was = false;
-        static bool primary_wake_swallowed = false;
+        static bool primary_consumed = false;
+        static uint32_t primary_started = 0;
+        static uint32_t last_press;
+        static unsigned presses;
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
-        if (primary_now != primary_was) {
-            if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
+        const uint32_t now = millis();
+        if (primary_now && !primary_was) {
+            primary_started = now;
+            primary_consumed = idle_consume_wake_press();
+            if (primary_consumed) presses = 0;
+        } else if (primary_now && !primary_consumed && now - primary_started >= 3000) {
+            primary_consumed = true;
+            presses = 0;
+            idle_sleep_now();
+        } else if (!primary_now && primary_was && !primary_consumed) {
+            if (now - last_press > 950) presses = 0;
+            last_press = now;
+            if (++presses == 5) {
+                presses = 0;
+                ui_start_ball_game();
             } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
+                ui_toggle_splash();
             }
-            primary_was = primary_now;
         }
+        primary_was = primary_now;
 
         if (board_caps().button_count >= 2) {
             static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
+                if (secondary_now && !idle_consume_wake_press()) {
+                    auto screen = static_cast<screen_t>((ui_get_current_screen() + 1) % SCREEN_COUNT);
+                    ui_show_screen(screen);
+                    const char* names[] = {"Claude", "Codex", "Notes"};
+                    Serial.printf("KEY: %s\n", names[screen]);
                 }
                 secondary_was = secondary_now;
             }
@@ -355,56 +447,22 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
-                if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-                else                                          brightness_cycle();
+                brightness_cycle();
             }
         }
 
-        pair_tick();
-    }
-
-    // ---- Zwischendurch die Zahlen zeigen ----
-    // Wer den Clawd als Animation laufen laesst, will trotzdem ab und zu
-    // sehen wie es um die Auslastung steht. Alle USAGE_PEEK_EVERY_MS also
-    // fuer USAGE_PEEK_SHOW_MS auf den Usage-Screen und wieder zurueck.
-    //
-    // Bewusst nur aus dem Splash heraus und nur solange der Nutzer nicht
-    // selbst umschaltet: ein Tastendruck waehrend des Abstechers beendet ihn,
-    // und wer laenger freiwillig auf den Zahlen steht, faengt danach mit
-    // vollem Abstand wieder an - sonst wechselt das Ding vor der Nase hin
-    // und her.
-    {
-        static uint32_t peek_ref_ms = 0;
-        static bool     peeking     = false;
-        const uint32_t now_ms = millis();
-        const screen_t cur    = ui_get_current_screen();
-
-        if (idle_is_asleep()) {
-            peek_ref_ms = now_ms;          // im Schlaf laeuft die Uhr nicht
-            peeking = false;
-        } else if (peeking) {
-            if (cur != SCREEN_USAGE) {     // Nutzer hat selbst umgeschaltet
-                peeking = false;
-                peek_ref_ms = now_ms;
-            } else if (now_ms - peek_ref_ms >= USAGE_PEEK_SHOW_MS) {
-                peeking = false;
-                peek_ref_ms = now_ms;
-                ui_show_screen(SCREEN_SPLASH);
-                Serial.println("peek: zurueck zu den Animationen");
-            }
-        } else if (cur != SCREEN_SPLASH) {
-            peek_ref_ms = now_ms;          // steht ohnehin auf den Zahlen
-        } else if (now_ms - peek_ref_ms >= USAGE_PEEK_EVERY_MS) {
-            peeking = true;
-            peek_ref_ms = now_ms;
-            ui_show_screen(SCREEN_USAGE);
-            Serial.println("peek: zeige kurz die Auslastung");
-        }
+#ifdef BOARD_AMOLED_216_C6
+        if (!wifi_sync_configured())
+#endif
+            pair_tick();
     }
 
     ble_state_t bs = ble_get_state();
+#ifdef BOARD_AMOLED_216_C6
+    if (wifi_sync_configured()) {
+        bs = wifi_sync_online() ? BLE_STATE_CONNECTED : BLE_STATE_INIT;
+    }
+#endif
     if (bs != last_ble_state) {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
@@ -428,6 +486,7 @@ void loop() {
     static bool vbus_known = false;
     static bool last_vbus  = false;
     bool vbus = power_hal_is_vbus_in();
+    screen_time_update_power(vbus);
     if (!vbus_known) {
         vbus_known = true;
         last_vbus  = vbus;
@@ -439,32 +498,98 @@ void loop() {
 
     check_serial_cmd();
 
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            bool session_reset = usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            // 5-hour session limit refilled → chime so the user knows they can
-            // use Claude again (no-op on boards without a buzzer). Gated on the
-            // daemon's opt-in `chime` config; the `buzz` serial cmd ignores it.
-            if (session_reset && usage.chime) {
-                Serial.println("session reset detected — chime");
-                sound_hal_play_reset();
+    const char* packet = nullptr;
+    bool via_wifi = false;
+#ifdef BOARD_AMOLED_216_C6
+    via_wifi = wifi_sync_configured();
+    if (via_wifi) packet = wifi_sync_receive();
+#endif
+    if (!via_wifi && ble_has_data()) packet = ble_get_data();
+    if (via_wifi && packet) {
+        JsonDocument message;
+        const bool decoded = !deserializeJson(message, packet);
+        if (decoded && message["localTime"].is<uint32_t>()) {
+            screen_time_set_clock(message["localTime"].as<uint32_t>());
+        }
+#ifdef BOARD_AMOLED_216_C6
+        if (decoded && message["control"] == true) {
+            const int page = message["page"] | -1;
+            if (page >= 0 && page < SCREEN_COUNT) ui_show_screen(static_cast<screen_t>(page));
+            const int level = message["brightness"] | -1;
+            if (level >= 0 && level < 4) brightness_set_step(level);
+            if (message["interval"].is<unsigned>()) ui_set_page_interval(message["interval"].as<unsigned>());
+            if (message["pin"].is<bool>()) ui_set_pinned(message["pin"].as<bool>());
+            if (message["mode"] == "game") ui_start_ball_game();
+            if (message["mode"] == "splash" && strcmp(ui_get_mode(), "splash")) {
+                if (!strcmp(ui_get_mode(), "game")) ui_show_screen(ui_get_current_screen());
+                ui_toggle_splash();
             }
-            // Host-driven animation. Sent only when the host is configured to
-            // mirror its desktop buddy; absent → "" → device keeps deciding.
-            splash_set_anim(usage.anim);
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
+            const auto duration = screen_time_totals();
+            char status[320];
+            snprintf(status, sizeof(status),
+                "{\"page\":%d,\"brightness\":%u,\"mode\":\"%s\",\"interval\":%u,\"pinned\":%s,"
+                "\"checks\":%lu,\"claudeAge\":%d,\"codexAge\":%d,"
+                "\"screenToday\":%lu,\"screenWeek\":%lu,\"screenTotal\":%lu,\"displayLit\":%s,\"chargeAge\":%ld}",
+                ui_get_current_screen(), brightness_get(), ui_get_mode(), ui_get_page_interval(),
+                ui_is_pinned() ? "true" : "false", static_cast<unsigned long>(ui_get_note_checks()),
+                ui_get_usage_age(SCREEN_USAGE), ui_get_usage_age(SCREEN_CODEX),
+                static_cast<unsigned long>(duration.today), static_cast<unsigned long>(duration.week),
+                static_cast<unsigned long>(duration.total), idle_is_display_lit() ? "true" : "false",
+                static_cast<long>(screen_time_since_charge()));
+            wifi_sync_ack(status);
+            packet = nullptr;
+        } else
+#endif
+        if (decoded && message["note"].is<const char*>()) {
+            const char* note = message["note"];
+            Preferences notes;
+            if (notes.begin("notes", false)) {
+                const bool unchanged = notes.getString("current") == note;
+                if (unchanged || notes.putString("current", note)) {
+                    if (!unchanged) notes.putUInt("checks", 0);
+                    if (!unchanged) ui_update_note(note);
+#ifdef BOARD_AMOLED_216_C6
+                    wifi_sync_ack();
+#endif
+                    Serial.println("Note saved");
+                }
+                notes.end();
             }
-            ui_update(&usage);
-            ble_send_ack();
+            packet = nullptr;
+        }
+    }
+    if (packet) {
+        if (parse_json(packet, &usage)) {
+            if (!via_wifi || usage.ok) {
+                bool session_reset = usage_rate_sample(usage.session_pct);
+                splash_set_anim(usage.anim);
+                if (session_reset && usage.chime) {
+                    Serial.println("session reset detected — chime");
+                    sound_hal_play_reset();
+                }
+                ui_update(&usage);
+#ifdef BOARD_AMOLED_216_C6
+                track_limit_change(SCREEN_USAGE, usage);
+#endif
+            }
+            if (codex_usage.valid) {
+                ui_update(&codex_usage, SCREEN_CODEX);
+#ifdef BOARD_AMOLED_216_C6
+                track_limit_change(SCREEN_CODEX, codex_usage);
+#endif
+                Serial.println("Codex limits updated");
+            }
+            if (!via_wifi) ble_send_ack();
+#ifdef BOARD_AMOLED_216_C6
+            else wifi_sync_ack();
+#endif
         } else {
-            ble_send_nack();
+            if (!via_wifi) ble_send_nack();
         }
     }
 
+#ifdef BOARD_AMOLED_216_C6
+    enter_board_sleep();
+#endif
     delay(5);
 }

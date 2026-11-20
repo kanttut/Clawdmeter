@@ -4,3 +4,6 @@ bleak
 httpx
 pystray
 Pillow
+cryptography
+customtkinter
+pyserial

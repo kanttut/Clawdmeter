@@ -13,15 +13,21 @@ enum IdleState {
 
 static IdleState state = STATE_AWAKE;
 static uint32_t last_activity_ms = 0;
+static uint32_t last_limit_change_ms = 0;
 static uint32_t fade_started_ms  = 0;
 static uint32_t fade_last_step_ms = 0;
 static uint8_t  fade_from = DISPLAY_DEFAULT_BRIGHTNESS;
 static uint8_t  fade_to   = 0;
 static uint8_t  awake_brightness = DISPLAY_DEFAULT_BRIGHTNESS;  // user-set "full" level (brightness.cpp)
+static uint8_t applied_brightness;
+static bool manual_sleep;
 
 static void apply_brightness(uint8_t b) {
+    applied_brightness = b;
     display_hal_set_brightness(b);
 }
+
+bool idle_is_display_lit(void) { return applied_brightness != 0; }
 
 static void begin_fade(uint8_t to, uint32_t now) {
     fade_from = (to == 0) ? awake_brightness : 0;
@@ -30,11 +36,21 @@ static void begin_fade(uint8_t to, uint32_t now) {
     fade_last_step_ms = now;
 }
 
+void idle_sleep_now(void) {
+    manual_sleep = true;
+    begin_fade(0, millis());
+    fade_from = applied_brightness;
+    state = STATE_FADING_OUT;
+}
+
 void idle_init(void) {
     state = STATE_AWAKE;
     last_activity_ms = millis();
+    last_limit_change_ms = last_activity_ms;
     apply_brightness(awake_brightness);
 }
+void idle_note_limit_change(void) { last_limit_change_ms = millis(); }
+bool idle_is_fully_asleep(void) { return state == STATE_ASLEEP; }
 
 void idle_set_awake_brightness(uint8_t level) {
     awake_brightness = level;
@@ -56,6 +72,7 @@ void idle_note_activity(void) {
 bool idle_consume_wake_press(void) {
     if (state == STATE_ASLEEP || state == STATE_FADING_OUT) {
         uint32_t now = millis();
+        manual_sleep = false;
         last_activity_ms = now;
         begin_fade(awake_brightness, now);
         state = STATE_FADING_IN;
@@ -80,7 +97,7 @@ void idle_tick(void) {
 
     // While on USB power (if configured), don't sleep — and wake from sleep
     // when power comes back. Treats USB-in as continuous activity.
-    if (!IDLE_SLEEP_WHEN_CHARGING && power_hal_is_vbus_in()) {
+    if (!manual_sleep && !IDLE_SLEEP_WHEN_CHARGING && power_hal_is_vbus_in()) {
         last_activity_ms = now;
         if (state == STATE_ASLEEP || state == STATE_FADING_OUT) {
             begin_fade(awake_brightness, now);
@@ -90,7 +107,11 @@ void idle_tick(void) {
 
     switch (state) {
     case STATE_AWAKE:
-        if (now - last_activity_ms >= IDLE_TIMEOUT_MS) {
+        if (now - last_activity_ms >= IDLE_TIMEOUT_MS
+#ifdef BOARD_AMOLED_216_C6
+            || now - last_limit_change_ms >= IDLE_TIMEOUT_MS
+#endif
+        ) {
             begin_fade(0, now);
             state = STATE_FADING_OUT;
         }

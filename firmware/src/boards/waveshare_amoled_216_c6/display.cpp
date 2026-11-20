@@ -151,6 +151,10 @@ void display_hal_tick(void) {
     // Rotation is fixed at boot - nothing to poll.
 }
 
+void board_display_sleep() {
+    if (gfx) gfx->displayOff();
+}
+
 // CO5300 requires even-aligned flush regions.
 void display_hal_round_area(int32_t* x1, int32_t* y1, int32_t* x2, int32_t* y2) {
     *x1 = *x1 & ~1;

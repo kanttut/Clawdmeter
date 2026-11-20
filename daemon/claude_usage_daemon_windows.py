@@ -12,6 +12,7 @@ import datetime
 import json
 import logging
 import logging.handlers
+import math
 import os
 import re
 import signal
@@ -22,6 +23,10 @@ import time
 from pathlib import Path
 
 import httpx
+try:
+    from .reset_clock import reset_clock
+except ImportError:
+    from reset_clock import reset_clock
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
@@ -45,6 +50,7 @@ RECONNECT_BACKOFF_CAP = 8  # D-05: fast-reconnect cap (seconds); keeps stacked r
 # Optional clock display. 
 # Config lives under the same Clawdmeter dir as daemon.log.
 CONFIG_FILE = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Clawdmeter" / "config"
+WIFI_CONFIG_FILE = CONFIG_FILE.parent / "wifi.json"
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -198,7 +204,11 @@ async def poll_api(token: str) -> dict | None:
         # "run claude login" toast.
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         raise AuthError(resp.status_code)
-    if resp.status_code >= 400:
+    if resp.status_code >= 400 and not (
+        resp.status_code == 429
+        and resp.headers.get("anthropic-ratelimit-unified-5h-status") == "rejected"
+        and resp.headers.get("anthropic-ratelimit-unified-7d-utilization")
+    ):
         # Other 4xx/5xx (rate-limit, server error) — transient, not a token issue.
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
@@ -222,12 +232,25 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
-    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization"):
+    if resp.headers.get("anthropic-ratelimit-unified-5h-utilization") or resp.status_code == 429:
+        reset_header = hdr("anthropic-ratelimit-unified-5h-reset", "")
+        weekly_header = hdr("anthropic-ratelimit-unified-7d-reset", "")
+
+        def reset_seconds(value):
+            try:
+                return max(0, math.ceil(float(value) - now)) if value else -1
+            except (ValueError, OverflowError):
+                return -1
         payload = {
-            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-            "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
+            "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization",
+                         "1" if resp.status_code == 429 else "0")),
+            "sr": reset_minutes(reset_header),
+            "ss": reset_seconds(reset_header),
+            "sa": reset_clock(reset_header),
             "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
             "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+            "ws": reset_seconds(weekly_header),
+            "wa": reset_clock(hdr("anthropic-ratelimit-unified-7d-reset")),
             "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
             "acct": "pro",
             "ok": True,
@@ -587,10 +610,14 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
     await session.setup_refresh_subscription()
 
     last_poll = 0.0  # D-03: poll immediately on first connect
+    last_codex_poll = 0.0
+    codex_limits = None
     used_successfully = False
     consecutive_failures = 0  # D-03: zombie-link break counter
     try:
         while client.is_connected and not stop_event.is_set():
+            if sys.platform == "win32" and WIFI_CONFIG_FILE.is_file():
+                break
             now = time.time()
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
@@ -609,6 +636,16 @@ async def connect_and_run(device, stop_event: asyncio.Event, tray_state=None) ->
                             tray_state.set_error("token expired — run claude login")
                         payload = None
                     if payload is not None:
+                        if sys.platform == "win32" and time.monotonic() - last_codex_poll >= POLL_INTERVAL:
+                            from daemon.codex_usage_windows import read_codex_limits
+                            last_codex_poll = time.monotonic()
+                            try:
+                                codex_limits = await read_codex_limits()
+                            except (OSError, TimeoutError, ValueError) as e:
+                                codex_limits = None
+                                log(f"Codex limits unavailable: {type(e).__name__}")
+                        if codex_limits is not None:
+                            payload["codex"] = codex_limits
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
@@ -698,6 +735,10 @@ async def main(tray_state=None) -> None:
     search_backoff = 1     # caps at 60s — gentle, for a device that is genuinely absent/off
     reconnect_backoff = 1  # caps at RECONNECT_BACKOFF_CAP — fast, to clear the 120s SLA after a drop
     while not stop_event.is_set():
+        if sys.platform == "win32" and WIFI_CONFIG_FILE.is_file():
+            from daemon.wifi_sync_windows import run_wifi_sync
+            await run_wifi_sync(sys.modules[__name__], stop_event, tray_state)
+            return
         device = await acquire_target()
         if not device:
             # Slow-search regime: device was not found by scan — back off gently

@@ -109,11 +109,14 @@ static uint16_t *row_buf = NULL;   // scratch row, sized to canvas_w (PSRAM path
 #endif
 
 #if SPLASH_DIRECT_DRAW
-static uint16_t*       strip_buf = NULL;   // one grid-row band: (GRID*scr_cell)×scr_cell
+#include "smooth_splash_assets.h"
+static constexpr int smooth_grid = 80;
+static_assert(sizeof(smooth_splashes) / sizeof(smooth_splashes[0]) == SPLASH_ANIM_COUNT);
+static uint16_t*       strip_buf = NULL;   // one grid-row band: (smooth_grid*scr_cell)×scr_cell
 static int             scr_cell  = 24;     // on-screen px per grid cell
 static int             scr_offx  = 0;      // centering offsets (square art on panel)
 static int             scr_offy  = 0;
-static uint8_t         prev_cells[GRID * GRID];
+static uint8_t         prev_cells[smooth_grid * smooth_grid];
 static const uint16_t* prev_palette = NULL;
 static bool            prev_valid   = false;
 static bool            force_full   = false;  // repaint everything on the next render
@@ -127,7 +130,7 @@ static uint32_t          wait_until_ms = 0;
 void splash_note_refresh_done(void) { refresh_seq++; }
 
 // Upscale grid cells [gx0..gx1]×[gy0..gy1] and push them to the panel, one
-// grid-row band at a time so the scratch buffer stays (GRID*scr_cell × scr_cell).
+// grid-row band at a time so the scratch buffer stays (smooth_grid*scr_cell × scr_cell).
 static void blit_cells(const uint8_t* cells, const uint16_t* palette,
                        int gx0, int gy0, int gx1, int gy1) {
     if (!strip_buf) return;
@@ -136,8 +139,8 @@ static void blit_cells(const uint8_t* cells, const uint16_t* palette,
     const int px  = scr_offx + gx0 * spc;
     for (int gy = gy0; gy <= gy1; gy++) {
         for (int gx = gx0; gx <= gx1; gx++) {       // expand one source row across
-            uint8_t code = cells[gy * GRID + gx];
-            uint16_t color = (palette && code < SPLASH_PALETTE_SIZE) ? palette[code] : COL_EMPTY;
+            uint8_t code = cells[gy * smooth_grid + gx];
+            uint16_t color = palette[code];
             uint16_t* p = &strip_buf[(gx - gx0) * spc];
             for (int i = 0; i < spc; i++) p[i] = color;
         }
@@ -147,18 +150,31 @@ static void blit_cells(const uint8_t* cells, const uint16_t* palette,
     }
 }
 
-static void render_frame(const uint8_t *cells, const uint16_t *palette) {
+static void render_current_frame() {
+    const auto& animation = smooth_splashes[cur_anim];
+    const uint16_t* palette = animation.palette;
+    static uint8_t frame[smooth_grid * smooth_grid];
+    const uint8_t* runs = animation.runs + animation.offsets[cur_frame];
+    size_t used = 0;
+    while (used < sizeof(frame)) {
+        const uint8_t run = *runs++;
+        const size_t length = (run >> 4) + 1;
+        if (length > sizeof(frame) - used) return;
+        memset(frame + used, run & 15, length);
+        used += length;
+    }
+    const uint8_t* cells = frame;
     if (!strip_buf) return;
     if (!active) return;          // never draw to the panel while not shown
     bool full = force_full || !prev_valid || palette != prev_palette;
     force_full = false;
 
-    int gx0 = 0, gy0 = 0, gx1 = GRID - 1, gy1 = GRID - 1;
+    int gx0 = 0, gy0 = 0, gx1 = smooth_grid - 1, gy1 = smooth_grid - 1;
     if (!full) {                                     // bounding box of changed cells
-        gx0 = GRID; gy0 = GRID; gx1 = -1; gy1 = -1;
-        for (int gy = 0; gy < GRID; gy++)
-            for (int gx = 0; gx < GRID; gx++)
-                if (cells[gy * GRID + gx] != prev_cells[gy * GRID + gx]) {
+        gx0 = smooth_grid; gy0 = smooth_grid; gx1 = -1; gy1 = -1;
+        for (int gy = 0; gy < smooth_grid; gy++)
+            for (int gx = 0; gx < smooth_grid; gx++)
+                if (cells[gy * smooth_grid + gx] != prev_cells[gy * smooth_grid + gx]) {
                     if (gx < gx0) gx0 = gx;
                     if (gx > gx1) gx1 = gx;
                     if (gy < gy0) gy0 = gy;
@@ -169,7 +185,7 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
 
     blit_cells(cells, palette, gx0, gy0, gx1, gy1);
 
-    memcpy(prev_cells, cells, GRID * GRID);
+    memcpy(prev_cells, cells, smooth_grid * smooth_grid);
     prev_palette = palette;
     prev_valid   = true;
 }
@@ -190,6 +206,13 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
         }
     }
     if (canvas) lv_obj_invalidate(canvas);
+}
+#endif
+
+#if !SPLASH_DIRECT_DRAW
+static void render_current_frame() {
+    const auto& animation = splash_anims[cur_anim];
+    render_frame(animation.frames[cur_frame], animation.palette);
 }
 #endif
 
@@ -285,8 +308,8 @@ void splash_init(lv_obj_t *parent) {
     // across the square art (GRID*scr_cell × scr_cell). On the C6 that's
     // 480×24×2 ≈ 23 KB of internal SRAM.
     int mind = (c.width < c.height) ? c.width : c.height;
-    scr_cell = mind / GRID;
-    int side = GRID * scr_cell;
+    scr_cell = mind / smooth_grid;
+    int side = smooth_grid * scr_cell;
     scr_offx = (c.width  - side) / 2;
     scr_offy = (c.height - side) / 2;
     strip_buf = (uint16_t*)heap_caps_malloc((size_t)side * scr_cell * 2,
@@ -368,8 +391,7 @@ void splash_tick(void) {
     // hochgehen und der Splash bliebe fuer immer leer.
     if (force_full && (refresh_seq != wait_seq
                        || (int32_t)(millis() - wait_until_ms) >= 0)) {
-        const splash_anim_def_t *fa = &splash_anims[cur_anim];
-        if (fa->frame_count) render_frame(fa->frames[cur_frame], fa->palette);
+        render_current_frame();
     }
 #endif
 
@@ -380,15 +402,26 @@ void splash_tick(void) {
         splash_pick_for_current_rate();
     }
 
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    if (a->frame_count == 0) return;
-
-    uint16_t hold = a->holds[cur_frame];
-    if (millis() - frame_started_ms >= hold) {
-        cur_frame = (cur_frame + 1) % a->frame_count;
-        frame_started_ms = millis();
-        render_frame(a->frames[cur_frame], a->palette);
+#if SPLASH_DIRECT_DRAW
+    const auto& animation = smooth_splashes[cur_anim];
+    const uint32_t elapsed = millis() - frame_started_ms;
+    if (elapsed >= animation.holds[cur_frame]) {
+        uint32_t remaining = elapsed;
+        while (remaining >= animation.holds[cur_frame]) {
+            remaining -= animation.holds[cur_frame];
+            cur_frame = (cur_frame + 1) % animation.count;
+        }
+        frame_started_ms += elapsed - remaining;
+        render_current_frame();
     }
+#else
+    const auto& animation = splash_anims[cur_anim];
+    if (animation.frame_count && millis() - frame_started_ms >= animation.holds[cur_frame]) {
+        cur_frame = (cur_frame + 1) % animation.frame_count;
+        frame_started_ms = millis();
+        render_current_frame();
+    }
+#endif
 }
 
 void splash_next(void) {
@@ -397,9 +430,8 @@ void splash_next(void) {
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
-    Serial.printf("splash: -> %s\n", a->name);
+    render_current_frame();
+    Serial.printf("splash: -> %s\n", splash_anims[cur_anim].name);
 }
 
 // Switch to splash_anims[idx] and draw its first frame.
@@ -408,8 +440,7 @@ static void show_anim(int idx) {
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
+    render_current_frame();
 }
 
 void splash_set_anim(const char *name) {
@@ -454,8 +485,7 @@ void splash_pick_for_current_rate(void) {
     cur_frame = 0;
     frame_started_ms = millis();
     last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
+    render_current_frame();
 }
 
 bool splash_is_active(void) { return active; }

@@ -4,8 +4,12 @@
 struct UsageData {
     float session_pct;       // utilization 0-100 (5h window Pro/Max; spending % Enterprise)
     int session_reset_mins;  // minutes until reset
+    int session_reset_secs;  // seconds until reset at receipt, or -1 if unavailable
     float weekly_pct;        // 7-day utilization (Pro/Max only; 0 for Enterprise)
     int weekly_reset_mins;   // minutes until weekly reset (Pro/Max only)
+    int weekly_reset_secs;   // seconds until weekly reset, or -1 if unavailable
+    char session_reset_clock[6];  // local HH:MM, empty when unavailable
+    char weekly_reset_clock[6];
     char status[16];         // "allowed", "limited", etc.
     bool chime;              // play the session-reset chime; false unless daemon opts in
     bool enterprise;         // true = Enterprise spending-limit account
