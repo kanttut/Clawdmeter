@@ -280,6 +280,15 @@ static uint32_t page_delay_ms = 5000;
 
 static bool page_pinned;
 static bool showing_splash = false;
+static bool demo_active;
+static unsigned demo_index;
+static screen_t demo_return_screen;
+static bool demo_return_pin;
+static UsageData demo_usage;
+static uint32_t demo_started_ms;
+static constexpr int demo_start_minutes = 12 * 60;
+
+bool ui_is_demo() { return demo_active; }
 
 void ui_set_pinned(bool pinned) {
     page_pinned = pinned;
@@ -296,7 +305,10 @@ void ui_set_page_interval(unsigned seconds) {
 
 bool ui_is_pinned() { return page_pinned; }
 unsigned ui_get_page_interval() { return page_interval_ms / 1000; }
-const char* ui_get_mode() { return ball_game ? "game" : showing_splash ? "splash" : "page"; }
+const char* ui_get_mode() {
+    if (demo_active) return "demo";
+    return ball_game ? "game" : showing_splash ? "splash" : "page";
+}
 uint32_t ui_get_note_checks() { return note_checks; }
 int ui_get_usage_age(screen_t screen) {
     return usage_by_screen[screen].valid ? int((lv_tick_get() - last_data_ms[screen]) / 1000) : -1;
@@ -857,14 +869,14 @@ static bool session_exhausted(const UsageData& data) {
 }
 
 static void tick_limit_timer(uint32_t now) {
-    const UsageData& data = usage_by_screen[current_screen];
+    const UsageData& data = demo_active ? demo_usage : usage_by_screen[current_screen];
     int seconds = data.session_reset_secs;
     if (seconds < 0 && data.session_reset_mins >= 0) seconds = data.session_reset_mins * 60;
     if (seconds < 0) {
         lv_label_set_text(lbl_limit_timer, "Reset time pending");
         return;
     }
-    const int elapsed = (now - last_data_ms[current_screen]) / 1000;
+    const int elapsed = (now - (demo_active ? demo_started_ms : last_data_ms[current_screen])) / 1000;
     seconds = seconds > elapsed ? seconds - elapsed : 0;
     lv_label_set_text_fmt(lbl_limit_timer, "%02d:%02d:%02d",
                           seconds / 3600, seconds / 60 % 60, seconds % 60);
@@ -991,13 +1003,13 @@ void ui_update(const UsageData* data, screen_t screen) {
     if (screen == SCREEN_USAGE) {
         if (clock_base_epoch && !data->clock_epoch) {
             clock_last_min = -1;
-            if (current_screen == SCREEN_USAGE) lv_label_set_text(lbl_title, "Claude");
+            if (!demo_active && current_screen == SCREEN_USAGE) lv_label_set_text(lbl_title, "Claude");
         }
         clock_base_epoch = data->clock_epoch;
         clock_base_ms = last_data_ms[screen];
         clock_fmt = data->clock_fmt;
     }
-    if (current_screen == screen) render_usage(data);
+    if (!demo_active && current_screen == screen) render_usage(data);
 }
 
 // Pick the usage-view sub-screen: pairing hint (BLE down), the idle "Zzz" screen
@@ -1009,7 +1021,9 @@ static void update_view_state(void) {
     if (current_screen == SCREEN_NOTES) return;
     if (!usage_group || !pair_group || !idle_group) return;
     int v;
-    if (usage_by_screen[current_screen].valid) {
+    if (demo_active) {
+        v = 2;
+    } else if (usage_by_screen[current_screen].valid) {
         v = s_ble_connected && lv_tick_get() - last_data_ms[current_screen] < DATA_FRESH_MS ? 2 : 3;
     } else if (!s_ble_connected) {
         v = 0;  // pairing hint
@@ -1205,7 +1219,7 @@ void ui_tick_anim(void) {
         tick_ball_game(lv_tick_get());
         return;
     }
-    if (!page_pinned && lv_tick_get() - page_started_ms >= page_delay_ms) {
+    if (!demo_active && !page_pinned && lv_tick_get() - page_started_ms >= page_delay_ms) {
         auto next = static_cast<screen_t>((current_screen + 1) % SCREEN_COUNT);
         ui_show_screen(next);
     }
@@ -1216,7 +1230,7 @@ void ui_tick_anim(void) {
         tick_waiting_animation(now);
         return;
     }
-    const UsageData& usage = usage_by_screen[current_screen];
+    const UsageData& usage = demo_active ? demo_usage : usage_by_screen[current_screen];
     if (view_state == 3) {
         const uint32_t minutes = (now - last_data_ms[current_screen]) / 60000;
         if (minutes == 0) lv_label_set_text_static(lbl_anim, "Last update <1m ago");
@@ -1240,7 +1254,7 @@ void ui_tick_anim(void) {
         }
     }
 
-    if (current_screen == SCREEN_CODEX) {
+    if (current_screen == SCREEN_CODEX && !demo_active) {
         if (now - thinking_last_ms >= 500) {
             thinking_last_ms = now;
             thinking_phase = (thinking_phase + 1) % 3;
@@ -1251,14 +1265,15 @@ void ui_tick_anim(void) {
 
     // Title clock: once the daemon has sent wall-clock time, replace "Usage" with
     // the live time, advanced locally so it ticks every minute between payloads.
-    if (current_screen == SCREEN_USAGE && clock_base_epoch > 0) {
-        time_t cur = (time_t)(clock_base_epoch + (now - clock_base_ms) / 1000);
+    if (current_screen == SCREEN_USAGE && (demo_active || clock_base_epoch > 0)) {
+        time_t cur = demo_active ? demo_start_minutes * 60 + (now - demo_started_ms) / 1000
+                                 : clock_base_epoch + (now - clock_base_ms) / 1000;
         struct tm tmv;
         gmtime_r(&cur, &tmv);   // epoch is already local wall-clock → gmtime keeps it as-is
         if (tmv.tm_min != clock_last_min) {   // only rewrite the title when the minute changes
             clock_last_min = tmv.tm_min;
             char tbuf[12];
-            if (clock_fmt == 12) {
+            if (!demo_active && clock_fmt == 12) {
                 int h12 = tmv.tm_hour % 12;
                 if (h12 == 0) h12 = 12;
                 snprintf(tbuf, sizeof(tbuf), "%d:%02d %s", h12, tmv.tm_min,
@@ -1269,6 +1284,8 @@ void ui_tick_anim(void) {
             lv_label_set_text(lbl_title, tbuf);
         }
     }
+
+    if (demo_active) return;
 
     if (now - anim_msg_start >= ANIM_MSG_MS) {
         anim_msg_idx = (anim_msg_idx + 1) % ANIM_MSG_COUNT;
@@ -1300,7 +1317,7 @@ void ui_tick_anim(void) {
     lv_label_set_text(lbl_anim, buf);
 }
 
-void ui_show_screen(screen_t screen) {
+static void show_screen(screen_t screen) {
     if (ball_game) {
         ball_game = false;
         lv_obj_set_hidden(idle_codex_img, false);
@@ -1336,8 +1353,75 @@ void ui_show_screen(screen_t screen) {
         lv_label_set_text(lbl_anim, "Listening");
     }
     clock_last_min = -1;
-    if (usage_by_screen[screen].valid) render_usage(&usage_by_screen[screen]);
+    if (demo_active) {
+        render_usage(&demo_usage);
+        lv_label_set_text_fmt(lbl_anim, "Demo %u/4", demo_index + 1);
+    } else if (usage_by_screen[screen].valid) {
+        render_usage(&usage_by_screen[screen]);
+    }
     update_view_state();
+}
+
+void ui_show_screen(screen_t screen) {
+    demo_active = false;
+    show_screen(screen);
+}
+
+static void show_demo_scenario(screen_t screen) {
+    struct Scenario {
+        int session_used;
+        int weekly_used;
+        int session_minutes;
+        int weekly_minutes;
+    };
+    static constexpr Scenario scenarios[] = {
+        {90, 90, 30, 17 * 60},
+        {50, 50, 150, 3 * 1440 + 12 * 60},
+        {10, 10, 270, 6 * 1440 + 7 * 60},
+        {100, 75, 25, 1440 + 18 * 60},
+    };
+    const auto& scenario = scenarios[demo_index];
+    demo_usage = {};
+    demo_usage.valid = true;
+    demo_usage.ok = true;
+    demo_usage.session_pct = scenario.session_used;
+    demo_usage.weekly_pct = scenario.weekly_used;
+    demo_usage.session_reset_mins = scenario.session_minutes;
+    demo_usage.weekly_reset_mins = scenario.weekly_minutes;
+    demo_usage.session_reset_secs = scenario.session_minutes * 60;
+    demo_usage.weekly_reset_secs = scenario.weekly_minutes * 60;
+    strlcpy(demo_usage.status, scenario.session_used == 100 ? "rejected" : "allowed",
+            sizeof(demo_usage.status));
+    const auto format_clock = [](char (&label)[6], int remaining) {
+        const unsigned minutes = (demo_start_minutes + remaining) % 1440;
+        snprintf(label, sizeof(label), "%02u:%02u", minutes / 60, minutes % 60);
+    };
+    format_clock(demo_usage.session_reset_clock, scenario.session_minutes);
+    format_clock(demo_usage.weekly_reset_clock, scenario.weekly_minutes);
+    demo_started_ms = lv_tick_get();
+    show_screen(screen);
+}
+
+void ui_toggle_demo() {
+    if (demo_active) {
+        ui_show_screen(demo_return_screen);
+        ui_set_pinned(demo_return_pin);
+        return;
+    }
+    demo_return_screen = current_screen;
+    demo_return_pin = page_pinned;
+    demo_active = true;
+    demo_index = 0;
+    show_demo_scenario(current_screen == SCREEN_CODEX ? SCREEN_CODEX : SCREEN_USAGE);
+}
+
+void ui_demo_next_scenario() {
+    demo_index = (demo_index + 1) % 4;
+    show_demo_scenario(current_screen);
+}
+
+void ui_demo_switch_provider() {
+    show_screen(current_screen == SCREEN_CODEX ? SCREEN_USAGE : SCREEN_CODEX);
 }
 
 void ui_start_ball_game(void) {
@@ -1365,6 +1449,7 @@ void ui_start_ball_game(void) {
 }
 
 void ui_toggle_splash(void) {
+    if (demo_active) ui_show_screen(current_screen);
     if (ball_game) {
         ui_show_screen(current_screen);
         return;

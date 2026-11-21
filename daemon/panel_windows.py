@@ -155,7 +155,8 @@ def main():
                 hours, remainder = divmod(seconds, 3600)
                 minutes, seconds = divmod(remainder, 60)
                 display.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-        mode = {"game": "Игра", "splash": "Заставка"}.get(response["mode"], PAGES[response["page"]])
+        mode = {"game": "Игра", "splash": "Заставка", "demo": "Тестовый режим"}.get(
+            response["mode"], PAGES[response["page"]])
         state_text.set(f"На связи · {mode}" + (" · закреплено" if response["pinned"] else ""))
         limit_text.set(f"Claude: {age(response['claudeAge'])}     Codex: {age(response['codexAge'])}")
         pin_text.set("Открепить" if response["pinned"] else "Закрепить")

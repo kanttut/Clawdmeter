@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "idle.h"
 #include "idle_cfg.h"
+#include "ui.h"
 #include "hal/display_hal.h"
 #include "hal/power_hal.h"
 
@@ -109,7 +110,7 @@ void idle_tick(void) {
     case STATE_AWAKE:
         if (now - last_activity_ms >= IDLE_TIMEOUT_MS
 #ifdef BOARD_AMOLED_216_C6
-            || now - last_limit_change_ms >= IDLE_TIMEOUT_MS
+            || (!ui_is_demo() && now - last_limit_change_ms >= IDLE_TIMEOUT_MS)
 #endif
         ) {
             begin_fade(0, now);

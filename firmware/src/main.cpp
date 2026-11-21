@@ -395,8 +395,8 @@ void loop() {
     if (!idle_is_asleep()) display_hal_tick();
 
     // ---- Physical buttons ----
-    //   PRIMARY   → toggle the animated splash
-    //   SECONDARY → Claude, Codex
+    //   PRIMARY   → splash, release after 3s for sleep, hold 5s for demo
+    //   SECONDARY → next page or demo scenario
     //   PWR       → cycle brightness;
     //               hold ~3s + release: pairing mode
     // First press from sleep is consumed as a wake-only event by
@@ -415,18 +415,25 @@ void loop() {
             primary_started = now;
             primary_consumed = idle_consume_wake_press();
             if (primary_consumed) presses = 0;
-        } else if (primary_now && !primary_consumed && now - primary_started >= 3000) {
+        } else if (primary_was && !primary_consumed && now - primary_started >= 5000) {
             primary_consumed = true;
             presses = 0;
-            idle_sleep_now();
+            ui_toggle_demo();
         } else if (!primary_now && primary_was && !primary_consumed) {
-            if (now - last_press > 950) presses = 0;
-            last_press = now;
-            if (++presses == 5) {
+            if (now - primary_started >= 3000) {
                 presses = 0;
-                ui_start_ball_game();
+                idle_sleep_now();
+            } else if (ui_is_demo()) {
+                ui_demo_switch_provider();
             } else {
-                ui_toggle_splash();
+                if (now - last_press > 950) presses = 0;
+                last_press = now;
+                if (++presses == 5) {
+                    presses = 0;
+                    ui_start_ball_game();
+                } else {
+                    ui_toggle_splash();
+                }
             }
         }
         primary_was = primary_now;
@@ -436,10 +443,14 @@ void loop() {
             bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
             if (secondary_now != secondary_was) {
                 if (secondary_now && !idle_consume_wake_press()) {
-                    auto screen = static_cast<screen_t>((ui_get_current_screen() + 1) % SCREEN_COUNT);
-                    ui_show_screen(screen);
-                    const char* names[] = {"Claude", "Codex", "Notes"};
-                    Serial.printf("KEY: %s\n", names[screen]);
+                    if (ui_is_demo()) {
+                        ui_demo_next_scenario();
+                    } else {
+                        auto screen = static_cast<screen_t>((ui_get_current_screen() + 1) % SCREEN_COUNT);
+                        ui_show_screen(screen);
+                        const char* names[] = {"Claude", "Codex", "Notes"};
+                        Serial.printf("KEY: %s\n", names[screen]);
+                    }
                 }
                 secondary_was = secondary_now;
             }
