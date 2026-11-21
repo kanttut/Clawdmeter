@@ -1,3 +1,4 @@
+#include "weekly_tea_frames.h"
 #include "ui.h"
 #include "splash.h"
 #include "charge_anim.h"
@@ -224,6 +225,8 @@ static lv_obj_t* bounce_canvas;
 alignas(4) static uint16_t bounce_pixels[48][112];
 static lv_obj_t* codex_reset_logo;
 static lv_obj_t* weekly_reading_canvas;
+static lv_obj_t* weekly_orbit_logo;
+static lv_obj_t* weekly_orbit_trail[7];
 alignas(4) static uint16_t weekly_reading_pixels[44][100];
 static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
@@ -808,6 +811,17 @@ static void init_usage_screen(lv_obj_t* scr) {
         lv_canvas_set_buffer(weekly_reading_canvas, weekly_reading_pixels, 100, 44, LV_COLOR_FORMAT_RGB565);
         lv_obj_align(weekly_reading_canvas, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y - 48);
         lv_obj_set_hidden(weekly_reading_canvas, true);
+        weekly_orbit_logo = lv_image_create(panel_weekly);
+        lv_obj_set_hidden(weekly_orbit_logo, true);
+        for (auto*& dot : weekly_orbit_trail) {
+            dot = lv_obj_create(panel_weekly);
+            lv_obj_remove_style_all(dot);
+            lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(dot, lv_color_hex(0xB3F6E2), 0);
+            lv_obj_set_hidden(dot, true);
+        }
     }
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
@@ -936,42 +950,52 @@ static void tick_codex_reset(uint32_t now) {
 }
 
 static void tick_weekly_reading(uint32_t now) {
-    const auto rect = [](int x, int y, int w, int h, lv_color_t color) {
-        const uint16_t pixel = lv_color_to_u16(color);
-        for (int row = y; row < y + h; ++row) {
-            for (int col = x; col < x + w; ++col) weekly_reading_pixels[row][col] = pixel;
+    const unsigned frame = (now / 75) % (sizeof(weekly_tea_offsets) / sizeof(weekly_tea_offsets[0]));
+    const uint8_t* run = weekly_tea_runs + weekly_tea_offsets[frame];
+    unsigned remaining = 0;
+    uint16_t color = 0;
+    for (auto& row : weekly_reading_pixels) {
+        for (auto& pixel : row) {
+            if (remaining == 0) {
+                remaining = *run++;
+                color = weekly_tea_palette[*run++];
+            }
+            pixel = color;
+            --remaining;
         }
-    };
-    const auto chair = lv_color_hex(0x81583E);
-    const auto paper = lv_color_hex(0xF0DAB7);
-    const auto dark = lv_color_hex(0x33211D);
-    const bool sip = now % 9000 >= 6500 && now % 9000 < 7650;
-    rect(0, 0, 100, 44, COL_PANEL);
-    rect(17, 9, 36, 30, chair);
-    rect(13, 14, 8, 21, chair);
-    rect(18, 37, 6, 6, chair);
-    rect(54, 37, 6, 6, chair);
-    rect(18, 30, 44, 9, chair);
-    rect(23, 12, 32, 22, COL_ACCENT);
-    rect(30, 9, 21, 23, COL_ACCENT);
-    rect(34, 17, 3, sip ? 1 : 4, dark);
-    rect(46, 17, 3, sip ? 1 : 4, dark);
-    rect(29, 24, 12, 9, paper);
-    rect(42, 23, 12, 9, paper);
-    rect(40, 24, 2, 9, dark);
-    rect(32, 26, 6, 1, chair);
-    rect(45, 26, 6, 1, chair);
-    if (now % 9000 > 4200 && now % 9000 < 4550) rect(42, 19, 7, 6, paper);
-    rect(63, 32, 24, 3, chair);
-    rect(68, 35, 3, 8, chair);
-    rect(81, 35, 3, 8, chair);
-    const int cup_x = sip ? 48 : 72;
-    const int cup_y = sip ? 18 : 25;
-    rect(cup_x, cup_y, 8, 7, paper);
-    rect(cup_x + 8, cup_y + 1, 3, 4, paper);
-    const int steam_y = cup_y - 3 - (now / 160) % 6;
-    rect(cup_x + 3, steam_y, 2, 2, COL_DIM);
-    rect(cup_x + 5, steam_y - 3, 2, 2, COL_DIM);
+    }
+    lv_obj_invalidate(weekly_reading_canvas);
+}
+
+static void tick_weekly_orbit(uint32_t now) {
+    const int center_x = -60;
+    const int center_y = L.usage_bar_y + L.bar_h / 2;
+    const float phase = (now % 8400) * (2.0f * PI / 8400.0f);
+    lv_obj_align(weekly_orbit_logo, LV_ALIGN_TOP_RIGHT, center_x + 40, center_y - 40);
+    lv_image_set_rotation(weekly_orbit_logo, (now % 21000) * 3600 / 21000);
+    for (unsigned i = 0; i < sizeof(weekly_orbit_trail) / sizeof(weekly_orbit_trail[0]); ++i) {
+        auto* dot = weekly_orbit_trail[i];
+        const float angle = phase - i * 0.14f;
+        const int diameter = i == 0 ? 8 : 4;
+        lv_obj_set_size(dot, diameter, diameter);
+        lv_obj_set_style_bg_opa(dot, 255 - i * 32, 0);
+        lv_obj_align(dot, LV_ALIGN_TOP_RIGHT, center_x + int(42 * cosf(angle)) + diameter / 2,
+                     center_y + int(15 * sinf(angle)) - diameter / 2);
+    }
+}
+
+static void draw_weekly_orbit_track() {
+    lv_obj_align(weekly_reading_canvas, LV_ALIGN_TOP_RIGHT, -10,
+                 L.usage_bar_y + L.bar_h / 2 - 22);
+    const auto background = lv_color_to_u16(COL_PANEL);
+    for (auto& row : weekly_reading_pixels) {
+        for (auto& pixel : row) pixel = background;
+    }
+    const auto track = lv_color_to_u16(lv_color_hex(0x51656B));
+    for (unsigned i = 0; i < 260; ++i) {
+        const float angle = i * (2.0f * PI / 260.0f);
+        weekly_reading_pixels[22 + lroundf(15 * sinf(angle))][50 + lroundf(42 * cosf(angle))] = track;
+    }
     lv_obj_invalidate(weekly_reading_canvas);
 }
 
@@ -1042,9 +1066,24 @@ static void render_usage(const UsageData* data) {
 
     const bool weekly_reading = weekly_reading_canvas && !data->enterprise &&
                                 current_screen == SCREEN_USAGE && data->weekly_pct >= 100;
-    lv_obj_set_hidden(bar_weekly, weekly_reading);
-    if (weekly_reading_canvas) lv_obj_set_hidden(weekly_reading_canvas, !weekly_reading);
-    if (weekly_reading) tick_weekly_reading(lv_tick_get());
+    const bool weekly_orbit = weekly_orbit_logo && !data->enterprise &&
+                              current_screen == SCREEN_CODEX && data->weekly_pct >= 100;
+    lv_obj_set_hidden(bar_weekly, weekly_reading || weekly_orbit);
+    if (weekly_reading_canvas) lv_obj_set_hidden(weekly_reading_canvas, !weekly_reading && !weekly_orbit);
+    if (weekly_reading) {
+        lv_obj_align(weekly_reading_canvas, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y - 48);
+        tick_weekly_reading(lv_tick_get());
+    }
+    if (weekly_orbit) draw_weekly_orbit_track();
+    if (weekly_orbit_logo) {
+        lv_obj_set_hidden(weekly_orbit_logo, !weekly_orbit);
+        for (auto* dot : weekly_orbit_trail) lv_obj_set_hidden(dot, !weekly_orbit);
+        if (weekly_orbit) {
+            lv_image_set_src(weekly_orbit_logo, &chatgpt_logo_dsc);
+            lv_image_set_scale(weekly_orbit_logo, 122);
+            tick_weekly_orbit(lv_tick_get());
+        }
+    }
     if (data->enterprise) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
@@ -1109,7 +1148,7 @@ static void update_view_state(void) {
     if (logo_img && !showing_splash) lv_obj_set_hidden(logo_img, v == 1);
     if (v == view_state) return;
     view_state = v;
-    lv_obj_set_hidden(lbl_anim, v == 1);
+    lv_obj_set_hidden(lbl_anim, demo_active || v == 1);
     lv_obj_set_style_opa(usage_group, v == 3 ? LV_OPA_60 : LV_OPA_COVER, 0);
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);
@@ -1326,9 +1365,17 @@ void ui_tick_anim(void) {
             else tick_bounce(now);
         }
     }
-    if (weekly_reading_canvas && !lv_obj_has_flag(weekly_reading_canvas, LV_OBJ_FLAG_HIDDEN)) {
+    if (weekly_orbit_logo && !lv_obj_has_flag(weekly_orbit_logo, LV_OBJ_FLAG_HIDDEN)) {
+        static uint32_t last_orbit_tick;
+        if (now - last_orbit_tick >= 50) {
+            last_orbit_tick = now;
+            tick_weekly_orbit(now);
+        }
+    }
+    if (current_screen == SCREEN_USAGE && weekly_reading_canvas &&
+        !lv_obj_has_flag(weekly_reading_canvas, LV_OBJ_FLAG_HIDDEN)) {
         static uint32_t last_reading_tick;
-        if (now - last_reading_tick >= 85) {
+        if (now - last_reading_tick >= 50) {
             last_reading_tick = now;
             tick_weekly_reading(now);
         }
@@ -1433,9 +1480,9 @@ static void show_screen(screen_t screen) {
         lv_label_set_text(lbl_anim, "Listening");
     }
     clock_last_min = -1;
+    lv_obj_set_hidden(lbl_anim, demo_active);
     if (demo_active) {
         render_usage(&demo_usage);
-        lv_label_set_text_fmt(lbl_anim, "Demo %u/4", demo_index + 1);
     } else if (usage_by_screen[screen].valid) {
         render_usage(&usage_by_screen[screen]);
     }
