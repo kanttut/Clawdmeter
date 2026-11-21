@@ -222,6 +222,9 @@ LV_FONT_DECLARE(notes_font);
 static lv_obj_t* lbl_limit_timer;
 static lv_obj_t* bounce_canvas;
 alignas(4) static uint16_t bounce_pixels[48][112];
+static lv_obj_t* codex_reset_logo;
+static lv_obj_t* weekly_reading_canvas;
+alignas(4) static uint16_t weekly_reading_pixels[44][100];
 static lv_obj_t* bar_weekly;
 static lv_obj_t* lbl_weekly_pct;
 static lv_obj_t* lbl_weekly_label;
@@ -772,6 +775,8 @@ static void init_usage_screen(lv_obj_t* scr) {
         lv_obj_align(bounce_canvas, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y - 48 - 4);
         lv_obj_add_flag(bounce_canvas, LV_OBJ_FLAG_HIDDEN);
     }
+    codex_reset_logo = lv_image_create(panel_session);
+    lv_obj_set_hidden(codex_reset_logo, true);
 
     // Enterprise-only overlays inside panel_session — hidden until enterprise data arrives
     lbl_session_pct_sym = lv_label_create(panel_session);
@@ -798,6 +803,12 @@ static void init_usage_screen(lv_obj_t* scr) {
                      &lbl_weekly_pct, &lbl_weekly_label,
                      &bar_weekly, &lbl_weekly_reset);
     lbl_weekly_reset_clock = make_reset_clock(panel_weekly);
+    if (!L.small_icons) {
+        weekly_reading_canvas = lv_canvas_create(panel_weekly);
+        lv_canvas_set_buffer(weekly_reading_canvas, weekly_reading_pixels, 100, 44, LV_COLOR_FORMAT_RGB565);
+        lv_obj_align(weekly_reading_canvas, LV_ALIGN_TOP_RIGHT, 0, L.usage_reset_y - 48);
+        lv_obj_set_hidden(weekly_reading_canvas, true);
+    }
     // Recolor enabled so enterprise period box can color pace and reset separately
     lv_label_set_recolor(lbl_weekly_reset, true);
 
@@ -915,6 +926,55 @@ static void tick_bounce(uint32_t now) {
     lv_obj_invalidate(bounce_canvas);
 }
 
+static void tick_codex_reset(uint32_t now) {
+    const int phase = now % 14000;
+    const float progress = (1.0f - cosf(phase * (2.0f * PI / 14000.0f))) * 0.5f;
+    const int width = L.content_w - 2 * L.panel_pad_x;
+    lv_obj_align(codex_reset_logo, LV_ALIGN_TOP_RIGHT, -12 - int(width * 0.42f * progress),
+                 L.usage_bar_y + L.bar_h / 2 - (L.small_icons ? 20 : 40));
+    lv_image_set_rotation(codex_reset_logo, (now % 11000) * 3600 / 11000);
+}
+
+static void tick_weekly_reading(uint32_t now) {
+    const auto rect = [](int x, int y, int w, int h, lv_color_t color) {
+        const uint16_t pixel = lv_color_to_u16(color);
+        for (int row = y; row < y + h; ++row) {
+            for (int col = x; col < x + w; ++col) weekly_reading_pixels[row][col] = pixel;
+        }
+    };
+    const auto chair = lv_color_hex(0x81583E);
+    const auto paper = lv_color_hex(0xF0DAB7);
+    const auto dark = lv_color_hex(0x33211D);
+    const bool sip = now % 9000 >= 6500 && now % 9000 < 7650;
+    rect(0, 0, 100, 44, COL_PANEL);
+    rect(17, 9, 36, 30, chair);
+    rect(13, 14, 8, 21, chair);
+    rect(18, 37, 6, 6, chair);
+    rect(54, 37, 6, 6, chair);
+    rect(18, 30, 44, 9, chair);
+    rect(23, 12, 32, 22, COL_ACCENT);
+    rect(30, 9, 21, 23, COL_ACCENT);
+    rect(34, 17, 3, sip ? 1 : 4, dark);
+    rect(46, 17, 3, sip ? 1 : 4, dark);
+    rect(29, 24, 12, 9, paper);
+    rect(42, 23, 12, 9, paper);
+    rect(40, 24, 2, 9, dark);
+    rect(32, 26, 6, 1, chair);
+    rect(45, 26, 6, 1, chair);
+    if (now % 9000 > 4200 && now % 9000 < 4550) rect(42, 19, 7, 6, paper);
+    rect(63, 32, 24, 3, chair);
+    rect(68, 35, 3, 8, chair);
+    rect(81, 35, 3, 8, chair);
+    const int cup_x = sip ? 48 : 72;
+    const int cup_y = sip ? 18 : 25;
+    rect(cup_x, cup_y, 8, 7, paper);
+    rect(cup_x + 8, cup_y + 1, 3, 4, paper);
+    const int steam_y = cup_y - 3 - (now / 160) % 6;
+    rect(cup_x + 3, steam_y, 2, 2, COL_DIM);
+    rect(cup_x + 5, steam_y - 3, 2, 2, COL_DIM);
+    lv_obj_invalidate(weekly_reading_canvas);
+}
+
 static void render_usage(const UsageData* data) {
     int s_pct = (int)(data->session_pct + 0.5f);
     lv_label_set_text(lbl_session_reset_clock, data->enterprise ? "" : data->session_reset_clock);
@@ -966,13 +1026,25 @@ static void render_usage(const UsageData* data) {
     const bool exhausted = session_exhausted(*data);
     lv_obj_set_hidden(bar_session, exhausted);
     lv_obj_set_hidden(lbl_limit_timer, !exhausted);
-    if (bounce_canvas) lv_obj_set_hidden(bounce_canvas, !exhausted);
+    if (bounce_canvas) lv_obj_set_hidden(bounce_canvas, !exhausted || current_screen == SCREEN_CODEX);
+    const bool codex_exhausted = exhausted && current_screen == SCREEN_CODEX;
+    lv_obj_set_hidden(codex_reset_logo, !codex_exhausted);
+    if (codex_exhausted) {
+        lv_image_set_src(codex_reset_logo, &chatgpt_logo_dsc);
+        lv_image_set_scale(codex_reset_logo, L.small_icons ? 128 : 102);
+        tick_codex_reset(lv_tick_get());
+    }
     if (exhausted) {
         lv_label_set_text_static(lbl_session_reset, "Resets in");
         lv_obj_move_foreground(lbl_limit_timer);
         tick_limit_timer(lv_tick_get());
     }
 
+    const bool weekly_reading = weekly_reading_canvas && !data->enterprise &&
+                                current_screen == SCREEN_USAGE && data->weekly_pct >= 100;
+    lv_obj_set_hidden(bar_weekly, weekly_reading);
+    if (weekly_reading_canvas) lv_obj_set_hidden(weekly_reading_canvas, !weekly_reading);
+    if (weekly_reading) tick_weekly_reading(lv_tick_get());
     if (data->enterprise) {
         // Period box: time % + dynamic pace color + "Resets <date>" label
         lv_label_set_text(lbl_weekly_label, "Period");
@@ -1250,7 +1322,15 @@ void ui_tick_anim(void) {
         static uint32_t last_bounce_tick = 0;
         if (now - last_bounce_tick >= 50) {
             last_bounce_tick = now;
-            tick_bounce(now);
+            if (current_screen == SCREEN_CODEX) tick_codex_reset(now);
+            else tick_bounce(now);
+        }
+    }
+    if (weekly_reading_canvas && !lv_obj_has_flag(weekly_reading_canvas, LV_OBJ_FLAG_HIDDEN)) {
+        static uint32_t last_reading_tick;
+        if (now - last_reading_tick >= 85) {
+            last_reading_tick = now;
+            tick_weekly_reading(now);
         }
     }
 
@@ -1374,13 +1454,19 @@ static void show_demo_scenario(screen_t screen) {
         int session_minutes;
         int weekly_minutes;
     };
-    static constexpr Scenario scenarios[] = {
-        {90, 90, 30, 17 * 60},
-        {50, 50, 150, 3 * 1440 + 12 * 60},
-        {10, 10, 270, 6 * 1440 + 7 * 60},
-        {100, 75, 25, 1440 + 18 * 60},
+    static constexpr Scenario claude[] = {
+        {93, 100, 37, 11 * 60 + 24},
+        {52, 43, 143, 4 * 1440 + 9 * 60},
+        {11, 8, 263, 6 * 1440 + 11 * 60},
+        {100, 74, 26, 2 * 1440 + 4 * 60},
     };
-    const auto& scenario = scenarios[demo_index];
+    static constexpr Scenario codex[] = {
+        {88, 100, 46, 14 * 60 + 38},
+        {47, 58, 168, 3 * 1440 + 5 * 60},
+        {9, 13, 274, 5 * 1440 + 22 * 60},
+        {100, 79, 19, 1440 + 15 * 60},
+    };
+    const auto& scenario = (screen == SCREEN_CODEX ? codex : claude)[demo_index];
     demo_usage = {};
     demo_usage.valid = true;
     demo_usage.ok = true;
@@ -1421,7 +1507,7 @@ void ui_demo_next_scenario() {
 }
 
 void ui_demo_switch_provider() {
-    show_screen(current_screen == SCREEN_CODEX ? SCREEN_USAGE : SCREEN_CODEX);
+    show_demo_scenario(current_screen == SCREEN_CODEX ? SCREEN_USAGE : SCREEN_CODEX);
 }
 
 void ui_start_ball_game(void) {
